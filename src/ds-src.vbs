@@ -12,7 +12,9 @@ Option Explicit
 '  数据来源
 '    余额  ->  https://api.deepseek.com/user/balance
 '               （API key 读自 ~/.claude/settings.json）
-'    用量  ->  https://platform.deepseek.com/api/v0/usage/{amount,cost}
+'    用量  ->  https://platform.deepseek.com/api/v0/usage/by_api_key/{amount,cost}
+'               ?start=&end=&tz= 按 key + 模型的小时桶；官网用量页用的就是它，
+'               当天数据几分钟内就进来（老的按天汇总接口滞后，仅作降级兜底）
 '               （userToken 读自 ~/.claude/ds-token.txt）
 '    兜底  ->  本地 Claude Code 会话记录 ~/.claude/projects/**/*.jsonl
 '
@@ -36,7 +38,7 @@ bal = 0
 If apiKey <> "" Then FetchBalance apiKey, balOk, bal
 
 ' ==================== 二、官网用量 ====================
-Dim userToken, oReq, oIn, oOut, oHit, oCost, usageOk
+Dim userToken, oReq, oIn, oOut, oHit, oCost, usageOk, gUsageNote
 userToken = ReadFileTrim(HOME & "\.claude\ds-token.txt")
 usageOk = False
 oReq = 0 : oIn = 0 : oOut = 0 : oHit = 0 : oCost = 0
@@ -62,7 +64,7 @@ If usageOk Then
   vCache  = Thousands(oHit)
   vTotal  = Thousands(oIn + oHit + oOut)
   If (oHit + oIn) > 0 Then vPct = FormatNumber(oHit / (oHit + oIn) * 100, 1, -1, 0, 0) Else vPct = "0"
-  vSource = "官方接口"
+  vSource = "官方接口 · " & gUsageNote
 Else
   vCost   = "--"
   vReq    = Thousands(lReq)
@@ -163,12 +165,109 @@ Sub FetchBalance(key, ByRef ok, ByRef value)
   End If
 End Sub
 
-' ==================== 官网用量（amount + cost） ====================
+' ==================== 官网用量：实时（按 key + 小时桶） ====================
+' 官网用量页读的是 /usage/by_api_key/{amount,cost}：按 API key + 模型，返回
+' start/end 区间内的小时桶。它比按天汇总的 /usage/{amount,cost} 新鲜得多 ——
+' 当天的数据几分钟内就进来，而按天那个要等官网自己的汇总任务，凌晨常常还是 0。
 Function FetchOfficialUsage(tok, ByRef req, ByRef miss, ByRef outTok, ByRef hit, ByRef cost)
+  If FetchRtUsage(tok, req, miss, outTok, hit, cost) Then
+    gUsageNote = "实时"
+    FetchOfficialUsage = True
+  Else
+    gUsageNote = "按天汇总"
+    FetchOfficialUsage = FetchOfficialUsageDaily(tok, req, miss, outTok, hit, cost)
+  End If
+End Function
+
+Function FetchRtUsage(tok, ByRef req, ByRef miss, ByRef outTok, ByRef hit, ByRef cost)
+  Dim tzSec, tzRound, off, s0, s1, q, amtJson, costJson
+
+  FetchRtUsage = False
+  req = 0 : miss = 0 : outTok = 0 : hit = 0 : cost = 0
+
+  ' 官网前端也把 tz 归一成整小时，余数补到 start/end 上（见 usage 页前端 s9()）
+  tzSec = CLng(LocalOffsetMinutes()) * 60
+  tzRound = 3600 * Int(tzSec / 3600)
+  off = tzSec - tzRound
+
+  ' DateToEpochSec 给的是「本地墙上零点当成 UTC」的值，减掉时区偏移才是真正的
+  ' 本地当天 00:00 的 epoch；半小时时区的余数 off 再补回去（对齐官网 s9() 的算法）
+  s0 = DateToEpochSec(Date()) - tzSec + off
+  s1 = s0 + 86400                            ' 次日 00:00，区间右开
+  q = "?start=" & s0 & "&end=" & s1 & "&tz=" & tzRound
+
+  amtJson = HttpGetOfficial("https://platform.deepseek.com/api/v0/usage/by_api_key/amount" & q, tok)
+  If amtJson = "" Then Exit Function
+  If InStr(amtJson, """biz_code"":0") = 0 Then Exit Function
+
+  SumUsageBlocks amtJson, req, hit, miss, outTok
+
+  costJson = HttpGetOfficial("https://platform.deepseek.com/api/v0/usage/by_api_key/cost" & q, tok)
+  If costJson <> "" Then cost = SumCostCny(costJson)
+
+  FetchRtUsage = True
+End Function
+
+' 把所有 "usage":{...} 桶里的各字段累加起来（跨 key、跨模型、跨小时）
+Sub SumUsageBlocks(json, ByRef req, ByRef hit, ByRef miss, ByRef outTok)
+  Dim re, m, blk
+  Set re = New RegExp
+  re.Pattern = """usage"":\{([^}]*)\}"
+  re.Global = True
+  For Each m In re.Execute(json)
+    blk = m.SubMatches(0)
+    req = req + FieldNum(blk, "REQUEST")
+    hit = hit + FieldNum(blk, "PROMPT_CACHE_HIT_TOKEN")
+    miss = miss + FieldNum(blk, "PROMPT_CACHE_MISS_TOKEN")
+    outTok = outTok + FieldNum(blk, "RESPONSE_TOKEN")
+  Next
+End Sub
+
+Function FieldNum(s, key)
+  Dim m
+  FieldNum = 0
+  Set m = New RegExp
+  m.Pattern = """" & key & """:(\d+)"
+  If m.Test(s) Then FieldNum = CDbl(m.Execute(s)(0).SubMatches(0))
+End Function
+
+' 只累加 CNY 那一段，避免账号同时有 USD 台账时重复计数。
+' 响应形状：data.biz_data.data[0] = { currency:"CNY", series[].buckets[].cost:"0.7597..." }
+Function SumCostCny(json)
+  Dim p, s, q, re, m, total
+  SumCostCny = 0
+  p = InStr(json, """currency"":""CNY""")
+  If p = 0 Then Exit Function
+  s = Mid(json, p)
+  q = InStr(2, s, """currency"":")
+  If q > 0 Then s = Left(s, q - 1)
+
+  Set re = New RegExp
+  re.Pattern = """cost"":""([0-9.]+)"""
+  re.Global = True
+  ' VBScript 没有 Val()，CDbl 又认区域设置的小数点：把 "." 换成系统的小数点再转
+  Dim decSep
+  decSep = Mid(CStr(1.5), 2, 1)
+  total = 0
+  For Each m In re.Execute(s)
+    total = total + CDbl(Replace(m.SubMatches(0), ".", decSep))
+  Next
+  SumCostCny = total
+End Function
+
+' 注意：DateDiff 把日期当「本地墙上时间」相减，所以这里得到的是本地零点被当成 UTC
+' 之后的秒数（= 真实 epoch + 时区偏移）。要真正的本地零点 epoch 得再减掉偏移，
+' 见 FetchRtUsage 里的 s0。
+Function DateToEpochSec(d)
+  DateToEpochSec = DateDiff("s", DateSerial(1970, 1, 1), d)
+End Function
+
+' ==================== 官网用量：按天汇总（降级兜底） ====================
+Function FetchOfficialUsageDaily(tok, ByRef req, ByRef miss, ByRef outTok, ByRef hit, ByRef cost)
   Dim y, mth, dayKey, amtJson, costJson, amtDay, costDay
   Dim aP, aH, aM, aO, aR, cP, cH, cM, cO, cR
 
-  FetchOfficialUsage = False
+  FetchOfficialUsageDaily = False
   req = 0 : miss = 0 : outTok = 0 : hit = 0 : cost = 0
 
   y = Year(Date())
@@ -196,7 +295,7 @@ Function FetchOfficialUsage(tok, ByRef req, ByRef miss, ByRef outTok, ByRef hit,
   outTok = aO
   cost = cP + cH + cM + cO + cR
 
-  FetchOfficialUsage = True
+  FetchOfficialUsageDaily = True
 End Function
 
 Function HttpGetOfficial(url, tok)
