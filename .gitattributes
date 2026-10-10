@@ -1,0 +1,11 @@
+# 仓库里统一存 LF，Windows 脚本检出时给 CRLF
+* text=auto eol=lf
+
+*.vbs text eol=crlf
+*.cmd text eol=crlf
+*.bat text eol=crlf
+
+# 二进制
+*.exe binary
+*.png binary
+*.ico binary
